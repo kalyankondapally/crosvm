@@ -5,17 +5,25 @@
 use std::sync::Arc;
 use std::u32;
 
+use std::thread;
+use libc::{EINVAL};
+
 use base::{
-    error, AsRawDescriptor, Event, MappedRegion, MemoryMapping, MemoryMappingBuilder, RawDescriptor,
+	error, Event, MappedRegion, MemoryMapping, MemoryMappingBuilder, RawDescriptor, AsRawDescriptor, PollContext, PollToken, wrap_descriptor,
 };
+
 use hypervisor::Datamatch;
 use msg_socket::{MsgReceiver, MsgSender};
 use resources::{Alloc, MmioType, SystemAllocator};
+use sys_util::{
+   Error as SysError,
+};
 
 use vfio_sys::*;
 use vm_control::{
     MaybeOwnedDescriptor, VmIrqRequest, VmIrqRequestSocket, VmIrqResponse,
     VmMemoryControlRequestSocket, VmMemoryRequest, VmMemoryResponse,
+    VfioDeviceResponseSocket, VfioDriverRequest, VfioDriverResponse,
 };
 
 use crate::pci::msix::{
@@ -471,6 +479,9 @@ pub struct VfioPciDevice {
 
     // scratch MemoryMapping to avoid unmap beform vm exit
     mem: Vec<MemoryMapping>,
+    service_socket: Option<VfioDeviceResponseSocket>,
+    active_thread: bool,
+    exit_evt: Event,
 }
 
 impl VfioPciDevice {
@@ -480,6 +491,8 @@ impl VfioPciDevice {
         vfio_device_socket_msi: VmIrqRequestSocket,
         vfio_device_socket_msix: VmIrqRequestSocket,
         vfio_device_socket_mem: VmMemoryControlRequestSocket,
+	vfio_service_socket: Option<VfioDeviceResponseSocket>,
+	exit_evt: Event,
     ) -> Self {
         let dev = Arc::new(device);
         let config = VfioPciConfig::new(Arc::clone(&dev));
@@ -531,6 +544,9 @@ impl VfioPciDevice {
             vm_socket_mem: vfio_device_socket_mem,
             device_data,
             mem: Vec::new(),
+	    service_socket: vfio_service_socket,
+	    active_thread: false,
+	    exit_evt: exit_evt,
         }
     }
 
@@ -766,6 +782,100 @@ impl VfioPciDevice {
             self.mem.append(&mut mem_map);
         }
     }
+
+    fn activate_thread(&mut self, device:Arc<VfioDevice>) {
+	/* start vfio service thread for dma map */
+        let service_socket: VfioDeviceResponseSocket;
+        match self.service_socket.take() {
+            Some(socket) => service_socket = socket,
+            None => return,
+        }
+
+        let exit_evt = match self.exit_evt.try_clone() {
+            Ok(e) => e,
+            Err(e) => {
+                error!("failed to clone exit_evt: {}", e);
+                return;
+            }
+        };  
+
+        let thread_result = thread::Builder::new()
+            .name("vfio".to_string())
+            .spawn(move || {
+                #[derive(PollToken)]
+                enum Token {
+                    VfioRequest,
+                    Exit,
+                }
+                let poll_ctx: PollContext<Token> = match PollContext::new()
+                    .and_then(|pc| pc.add(&wrap_descriptor(&service_socket), Token::VfioRequest).and(Ok(pc)))
+                    .and_then(|pc| pc.add(&wrap_descriptor(&exit_evt), Token::Exit).and(Ok(pc)))
+                {
+                    Ok(pc) => pc,
+                    Err(e) => {
+                        error!("failed creating PollContext: {}", e);
+                        return;
+                    }
+                };
+
+                'poll: loop {
+                    let events = match poll_ctx.wait() {
+                        Ok(v) => v,
+                        Err(e) => {
+                            error!("failed polling for events: {}", e);
+                            break;
+                        }
+                    };
+
+	            for event in events.iter_readable() {
+                        match event.token() {
+                            Token::VfioRequest => {
+                                let req = match service_socket.recv() {
+                                    Ok(req) => req,
+                                    Err(e) => {
+                                        error!("service socket failed recv: {:?}", e);
+                                        if poll_ctx.delete(&wrap_descriptor(&service_socket)).is_err() {
+                                            error!("failed to delete vfio service_socket from poll_context");
+                                        }
+                                        break;
+                                    }
+                                };
+                                let resp = match req {
+                                    VfioDriverRequest::DmaMap(iova, size, host_addr) => {
+                                        match unsafe { device.vfio_dma_map(iova, size, host_addr) } {
+                                            Ok(()) => VfioDriverResponse::Ok,
+                                            _ => VfioDriverResponse::Err(SysError::new(EINVAL)),
+                                        }
+                                    }
+                                    VfioDriverRequest::DmaUnmap(iova, size) => {
+                                        match device.vfio_dma_unmap(iova, size) {
+                                            Ok(()) => VfioDriverResponse::Ok,
+                                            _ => VfioDriverResponse::Err(SysError::new(EINVAL)),
+                                        }
+                                    }
+                                };
+
+				if let Err(e) = service_socket.send(&resp) {
+                                    error!("service socket failed send: {:?}", e);
+                                    if poll_ctx.delete(&wrap_descriptor(&service_socket)).is_err() {
+                                        error!("failed to delete vfio service_socket from poll_context");
+                                    }
+                                    break;
+                                }
+                            }
+                            Token::Exit => break 'poll,
+                        }
+                    }
+                }
+            });
+
+        if let Err(e) = thread_result {
+            error!("failed to spawn vfio thread: {}", e);
+            return;
+        }
+
+	self.active_thread = true;
+    }
 }
 
 impl PciDevice for VfioPciDevice {
@@ -988,6 +1098,10 @@ impl PciDevice for VfioPciDevice {
     }
 
     fn write_config_register(&mut self, reg_idx: usize, offset: u64, data: &[u8]) {
+	if !self.active_thread {
+	    self.activate_thread(self.device.clone());
+	}
+	
         let start = (reg_idx * 4) as u64 + offset;
 
         let mut msi_change: Option<VfioMsiChange> = None;

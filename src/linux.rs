@@ -65,6 +65,7 @@ use vm_control::{
     VmIrqRequestSocket, VmIrqResponse, VmIrqResponseSocket, VmMemoryControlRequestSocket,
     VmMemoryControlResponseSocket, VmMemoryRequest, VmMemoryResponse, VmMsyncRequest,
     VmMsyncRequestSocket, VmMsyncResponse, VmMsyncResponseSocket, VmRunMode,
+    VfioDeviceRequestSocket, VfioDeviceResponseSocket, VfioDriverRequest, VfioDriverResponse,
 };
 use vm_memory::{GuestAddress, GuestMemory};
 
@@ -1409,6 +1410,7 @@ fn create_devices(
     disk_device_sockets: &mut Vec<DiskControlResponseSocket>,
     pmem_device_sockets: &mut Vec<VmMsyncRequestSocket>,
     usb_provider: HostBackendDeviceProvider,
+    vfio_service_socket: Option<VfioDeviceResponseSocket>,
     map_request: Arc<Mutex<Option<ExternalMapping>>>,
 ) -> DeviceResult<Vec<(Box<dyn PciDevice>, Option<Minijail>)>> {
     let stubs = create_virtio_devices(
@@ -1452,7 +1454,7 @@ fn create_devices(
         let vfio_container = Arc::new(Mutex::new(
             VfioContainer::new().map_err(Error::CreateVfioDevice)?,
         ));
-
+	
         for vfio_path in &cfg.vfio {
             // create MSI, MSI-X, and Mem request sockets for each vfio device
             let (vfio_host_socket_msi, vfio_device_socket_msi) =
@@ -1475,8 +1477,15 @@ fn create_devices(
                 vfio_device_socket_msi,
                 vfio_device_socket_msix,
                 vfio_device_socket_mem,
+		vfio_service_socket,
+		exit_evt.try_clone().map_err(Error::CloneEvent)?,
             ));
             pci_devices.push((vfiopcidevice, simple_jail(&cfg, "vfio_device")?));
+
+	    //WARNING: hacking to only one VFIO device for service!!! which is for DG1
+	    //otherwise above service socket can't be moved to one instance, Rust will
+	    //report error as this is in a loop..
+	    break;
         }
     }
 
@@ -2055,6 +2064,16 @@ where
         msg_socket::pair::<VmIrqResponse, VmIrqRequest>().map_err(Error::CreateSocket)?;
     control_sockets.push(TaggedControlSocket::VmIrq(ioapic_host_socket));
 
+    let mut vfio_service_socket_opt: Option<VfioDeviceResponseSocket> = None;
+    let mut vfio_client_socket_opt: Option<VfioDeviceRequestSocket> = None;
+    if !cfg.vfio.is_empty() {
+	let (vfio_service_socket, vfio_client_socket) =
+	    msg_socket::pair::<VfioDriverResponse, VfioDriverRequest>()
+	    .map_err(Error::CreateSocket)?;                                                                                                                                                
+        vfio_service_socket_opt = Some(vfio_service_socket);
+	vfio_client_socket_opt = Some(vfio_client_socket);
+    }
+    
     let map_request: Arc<Mutex<Option<ExternalMapping>>> = Arc::new(Mutex::new(None));
 
     let linux: RunnableLinuxVm<_, Vcpu, _> = Arch::build_vm(
@@ -2075,6 +2094,7 @@ where
                 &mut disk_device_sockets,
                 &mut pmem_device_sockets,
                 usb_provider,
+		vfio_service_socket_opt,
                 Arc::clone(&map_request),
             )
         },
@@ -2090,6 +2110,7 @@ where
         balloon_host_socket,
         &disk_host_sockets,
         usb_control_socket,
+	vfio_client_socket_opt,
         sigchld_fd,
         cfg.sandbox,
         Arc::clone(&map_request),
@@ -2103,6 +2124,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static, I: IrqChipArch + '
     balloon_host_socket: BalloonControlRequestSocket,
     disk_host_sockets: &[DiskControlRequestSocket],
     usb_control_socket: UsbControlSocket,
+    vfio_client_socket: Option<VfioDeviceRequestSocket>,
     sigchld_fd: SignalFd,
     sandbox: bool,
     map_request: Arc<Mutex<Option<ExternalMapping>>>,
@@ -2428,6 +2450,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static, I: IrqChipArch + '
                                         &mut linux.vm,
                                         &mut linux.resources,
                                         Arc::clone(&map_request),
+					&vfio_client_socket,
                                     );
                                     if let Err(e) = socket.send(&response) {
                                         error!("failed to send VmMemoryControlResponse: {}", e);
